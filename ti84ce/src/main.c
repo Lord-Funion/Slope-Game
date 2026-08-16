@@ -8,13 +8,12 @@
 #include <tice.h>
 
 /*
- * Slope CE Native -- fidelity pass
+ * Slope CE Native -- performance pass
  *
- * Native fixed-point recreation of the classic Unity/WebGL Slope look and
- * gameplay. The CE cannot execute the Unity build itself, so this renderer
- * spends its frame budget on the recognizable parts: black geometry with
- * neon green/red wireframes, a gridded rolling ball, perspective city walls,
- * procedural downhill track, ramps/gaps, inertial steering and speed ramping.
+ * Keep the recognizable Slope presentation, but design the renderer around
+ * the eZ80 instead of around a desktop 3D pipeline.  The critical rule here
+ * is that project_point() performs NO division during gameplay.  A reciprocal
+ * table is built once at startup, then projection is multiply + shift.
  */
 
 #define SCREEN_W 320
@@ -27,6 +26,9 @@
 #define BALL_Z 43
 #define SEG_LEN 13
 #define SEG_COUNT 32
+#define RENDER_SEGMENTS 24
+#define MAX_PROJECT_Z 430
+#define RECIP_SHIFT 12
 #define Q 256
 
 #define TRACK_HALF_W 29
@@ -68,7 +70,7 @@ typedef struct {
     uint8_t half_width;
     uint8_t solid;
     uint8_t ramp;
-    uint8_t obstacle_mask; /* bit 0 left, bit 1 center, bit 2 right */
+    uint8_t obstacle_mask;
     uint8_t obstacle_size;
     uint8_t left_tower;
     uint8_t right_tower;
@@ -77,8 +79,13 @@ typedef struct {
 typedef struct {
     int x;
     int y;
-    bool visible;
+    uint8_t visible;
 } ScreenPoint;
+
+typedef struct {
+    ScreenPoint p[5];
+    uint8_t valid;
+} RoadProjection;
 
 typedef struct {
     uint32_t magic;
@@ -86,6 +93,9 @@ typedef struct {
 } SaveData;
 
 static Segment segments[SEG_COUNT];
+static RoadProjection road_cache[RENDER_SEGMENTS + 1];
+static uint16_t reciprocal_z[MAX_PROJECT_Z + 1];
+
 static uint32_t rng_state = 0x9E3779B9UL;
 static int16_t generation_curve;
 static int16_t generation_height_velocity;
@@ -149,6 +159,14 @@ static void init_palette(void) {
     gfx_palette[C_SHADOW]       = gfx_RGBTo1555(0, 8, 3);
 }
 
+static void init_projection(void) {
+    int z;
+    memset(reciprocal_z, 0, sizeof(reciprocal_z));
+    for (z = 5; z <= MAX_PROJECT_Z; ++z) {
+        reciprocal_z[z] = (uint16_t)((1U << RECIP_SHIFT) / (unsigned)z);
+    }
+}
+
 static void load_high_score(void) {
     SaveData data;
     uint8_t handle = ti_Open(SAVE_NAME, "r");
@@ -174,8 +192,7 @@ static void save_high_score(void) {
 }
 
 static uint8_t random_obstacle_mask(uint32_t r) {
-    uint8_t pattern = (uint8_t)((r >> 18) & 7U);
-    switch (pattern) {
+    switch ((uint8_t)((r >> 18) & 7U)) {
         case 0: return 0x01;
         case 1: return 0x02;
         case 2: return 0x04;
@@ -191,15 +208,11 @@ static void generate_segment(Segment *out, const Segment *prev, uint8_t index_fr
     int16_t cx = prev->center_x;
     int16_t h = prev->height;
 
-    /* Smooth-ish turns: change curvature rarely, then carry it forward. */
-    if ((r & 31U) == 0U) {
-        generation_curve += (int16_t)(((r >> 8) & 1U) ? 1 : -1);
-    }
+    if ((r & 31U) == 0U) generation_curve += (int16_t)(((r >> 8) & 1U) ? 1 : -1);
     if ((r & 127U) == 17U) generation_curve = 0;
     generation_curve = clamp16(generation_curve, -4, 4);
     cx = clamp16((int16_t)(cx + generation_curve), -58, 58);
 
-    /* Long rises/drops instead of one-segment vertical noise. */
     if (((r >> 4) & 63U) == 7U && generation_height_velocity == 0) {
         generation_height_velocity = (int16_t)(((r >> 15) & 1U) ? 2 : -2);
     }
@@ -215,8 +228,8 @@ static void generate_segment(Segment *out, const Segment *prev, uint8_t index_fr
     out->ramp = 0;
     out->obstacle_mask = 0;
     out->obstacle_size = (uint8_t)(9 + ((r >> 5) & 3U));
-    out->left_tower = (uint8_t)(18 + ((r >> 16) & 45U));
-    out->right_tower = (uint8_t)(18 + ((r >> 22) & 45U));
+    out->left_tower = (uint8_t)(18 + ((r >> 16) & 31U));
+    out->right_tower = (uint8_t)(18 + ((r >> 21) & 31U));
 
     if (generation_narrow_timer) {
         out->half_width = (uint8_t)(20 + (generation_narrow_timer & 1U) * 2U);
@@ -249,13 +262,11 @@ static void build_initial_track(void) {
     segments[0].height = 0;
     segments[0].half_width = TRACK_HALF_W;
     segments[0].solid = 1;
-    segments[0].obstacle_mask = 0;
     segments[0].left_tower = 28;
     segments[0].right_tower = 34;
 
     for (i = 1; i < SEG_COUNT; ++i) generate_segment(&segments[i], &segments[i - 1], i);
 
-    /* A predictable early jump teaches the mechanic before random gaps appear. */
     segments[11].ramp = 1;
     segments[12].solid = 0;
     segments[13].solid = 0;
@@ -270,7 +281,6 @@ static void append_far_segment(void) {
     for (i = 0; i < SEG_COUNT - 1; ++i) segments[i] = segments[i + 1];
     generate_segment(&segments[SEG_COUNT - 1], &old_last, SEG_COUNT - 1);
 
-    /* Gap event: ramp + two empty slabs + landing. */
     if ((rand32() & 79U) == 9U &&
         segments[SEG_COUNT - 6].solid && segments[SEG_COUNT - 5].solid &&
         segments[SEG_COUNT - 4].solid) {
@@ -302,18 +312,24 @@ static void reset_game(void) {
     mode = MODE_PLAY;
 }
 
+/* Hot path: no divide. Camera sub-pixel precision is intentionally discarded. */
 static ScreenPoint project_point(int16_t world_x, int16_t world_y, int16_t z) {
     ScreenPoint p;
-    int32_t rel_x;
-    if (z < 5) {
-        p.x = p.y = 0;
-        p.visible = false;
+    int16_t dx;
+    uint16_t inv;
+
+    if (z < 5 || z > MAX_PROJECT_Z) {
+        p.x = 0;
+        p.y = 0;
+        p.visible = 0;
         return p;
     }
-    rel_x = ((int32_t)world_x * Q) - camera_x_q8;
-    p.x = (SCREEN_W / 2) + (int)(rel_x * FOCAL_X / ((int32_t)z * Q));
-    p.y = HORIZON_Y + (int)(((int32_t)(CAMERA_HEIGHT - world_y) * FOCAL_Y) / z);
-    p.visible = p.x > -96 && p.x < SCREEN_W + 96 && p.y > -96 && p.y < SCREEN_H + 96;
+
+    inv = reciprocal_z[z];
+    dx = (int16_t)(world_x - (int16_t)(camera_x_q8 >> 8));
+    p.x = (SCREEN_W / 2) + (int)(((int32_t)dx * FOCAL_X * inv) >> RECIP_SHIFT);
+    p.y = HORIZON_Y + (int)(((int32_t)(CAMERA_HEIGHT - world_y) * FOCAL_Y * inv) >> RECIP_SHIFT);
+    p.visible = (uint8_t)(p.x > -48 && p.x < SCREEN_W + 48 && p.y > -48 && p.y < SCREEN_H + 48);
     return p;
 }
 
@@ -379,7 +395,6 @@ static void update_game(bool left, bool right) {
     int16_t center, ground_h, half_w, px, ball_bottom;
     bool solid, ramp;
 
-    /* Deliberately inertial: tapping nudges the ball; holding builds a slide. */
     if (left && !right) player_vx_q8 -= 55;
     if (right && !left) player_vx_q8 += 55;
     player_vx_q8 = (player_vx_q8 * 234) >> 8;
@@ -437,160 +452,144 @@ static void update_game(bool left, bool right) {
     check_obstacle_collision();
 }
 
-static void fill_quad(ScreenPoint a, ScreenPoint b, ScreenPoint c, ScreenPoint d, uint8_t color) {
-    gfx_SetColor(color);
-    gfx_FillTriangle(a.x, a.y, b.x, b.y, c.x, c.y);
-    gfx_FillTriangle(a.x, a.y, c.x, c.y, d.x, d.y);
+static bool on_screen(ScreenPoint p) {
+    return p.x >= 0 && p.x < SCREEN_W && p.y >= 0 && p.y < SCREEN_H;
+}
+
+static void line_fast(ScreenPoint a, ScreenPoint b) {
+    if (!a.visible && !b.visible) return;
+    if (on_screen(a) && on_screen(b)) {
+        gfx_Line_NoClip((uint24_t)a.x, (uint8_t)a.y, (uint24_t)b.x, (uint8_t)b.y);
+    } else {
+        gfx_Line(a.x, a.y, b.x, b.y);
+    }
 }
 
 static void draw_background(void) {
-    gfx_FillScreen(C_BLACK);
+    gfx_ZeroScreen();
     gfx_SetColor(C_VOID_GREEN);
-    gfx_HorizLine(0, HORIZON_Y, SCREEN_W);
+    gfx_HorizLine_NoClip(0, HORIZON_Y, SCREEN_W);
 }
 
-static void draw_tower_grid(const Segment *s, int16_t z, bool right_side) {
-    int16_t side = right_side ? 1 : -1;
-    int16_t base_x = (int16_t)(s->center_x + side * (s->half_width + 38));
-    int16_t h = right_side ? s->right_tower : s->left_tower;
-    int16_t hw = 11;
-    int16_t depth = 10;
-    ScreenPoint fbl, fbr, ftl, ftr, btl, btr, bbl, bbr;
-    int16_t y;
+static void build_road_cache(void) {
+    uint8_t i;
+    for (i = 0; i <= RENDER_SEGMENTS; ++i) {
+        const Segment *s = &segments[i];
+        int16_t z = segment_z(i);
+        uint8_t lane;
 
-    if (z < 18 || z > 390) return;
+        if (z < 7) z = 7;
+        if (z > MAX_PROJECT_Z) {
+            road_cache[i].valid = 0;
+            continue;
+        }
+        road_cache[i].valid = 1;
+        for (lane = 0; lane < 5; ++lane) {
+            int16_t wx = (int16_t)(s->center_x - s->half_width +
+                (((int16_t)(s->half_width * 2) * lane) >> 2));
+            road_cache[i].p[lane] = project_point(wx, s->height, z);
+        }
+    }
+}
 
-    fbl = project_point((int16_t)(base_x - hw), s->height, (int16_t)(z - depth));
-    fbr = project_point((int16_t)(base_x + hw), s->height, (int16_t)(z - depth));
-    ftl = project_point((int16_t)(base_x - hw), (int16_t)(s->height + h), (int16_t)(z - depth));
-    ftr = project_point((int16_t)(base_x + hw), (int16_t)(s->height + h), (int16_t)(z - depth));
-    bbl = project_point((int16_t)(base_x - hw), s->height, (int16_t)(z + depth));
-    bbr = project_point((int16_t)(base_x + hw), s->height, (int16_t)(z + depth));
-    btl = project_point((int16_t)(base_x - hw), (int16_t)(s->height + h), (int16_t)(z + depth));
-    btr = project_point((int16_t)(base_x + hw), (int16_t)(s->height + h), (int16_t)(z + depth));
+static void draw_tower_front(const Segment *s, int16_t z, bool right_side) {
+    int16_t base_x;
+    int16_t h;
+    ScreenPoint bl, br, tl, tr, ml, mr;
 
-    if (!ftl.visible && !ftr.visible && !fbl.visible && !fbr.visible) return;
+    if (z < 24 || z > 330) return;
+    base_x = (int16_t)(s->center_x + (right_side ? s->half_width + 41 : -s->half_width - 41));
+    h = right_side ? s->right_tower : s->left_tower;
 
-    fill_quad(ftl, ftr, fbr, fbl, C_BLACK);
+    bl = project_point((int16_t)(base_x - 9), s->height, z);
+    br = project_point((int16_t)(base_x + 9), s->height, z);
+    tl = project_point((int16_t)(base_x - 9), (int16_t)(s->height + h), z);
+    tr = project_point((int16_t)(base_x + 9), (int16_t)(s->height + h), z);
+    if (!bl.visible && !br.visible && !tl.visible && !tr.visible) return;
+
     gfx_SetColor(C_GRID_DIM);
-    gfx_Line(ftl.x, ftl.y, ftr.x, ftr.y);
-    gfx_Line(ftr.x, ftr.y, fbr.x, fbr.y);
-    gfx_Line(fbr.x, fbr.y, fbl.x, fbl.y);
-    gfx_Line(fbl.x, fbl.y, ftl.x, ftl.y);
-    gfx_Line(ftl.x, ftl.y, btl.x, btl.y);
-    gfx_Line(ftr.x, ftr.y, btr.x, btr.y);
-    gfx_Line(fbl.x, fbl.y, bbl.x, bbl.y);
-    gfx_Line(fbr.x, fbr.y, bbr.x, bbr.y);
+    line_fast(bl, tl);
+    line_fast(tl, tr);
+    line_fast(tr, br);
 
-    /* sparse windows/grid keeps the city recognizable without crushing FPS */
-    for (y = 10; y < h; y += 10) {
-        ScreenPoint l = project_point((int16_t)(base_x - hw), (int16_t)(s->height + y), (int16_t)(z - depth));
-        ScreenPoint r = project_point((int16_t)(base_x + hw), (int16_t)(s->height + y), (int16_t)(z - depth));
-        gfx_Line(l.x, l.y, r.x, r.y);
-    }
-
-    {
-        ScreenPoint mt = project_point(base_x, (int16_t)(s->height + h), (int16_t)(z - depth));
-        ScreenPoint mb = project_point(base_x, s->height, (int16_t)(z - depth));
-        gfx_Line(mt.x, mt.y, mb.x, mb.y);
-    }
+    ml = project_point((int16_t)(base_x - 9), (int16_t)(s->height + (h >> 1)), z);
+    mr = project_point((int16_t)(base_x + 9), (int16_t)(s->height + (h >> 1)), z);
+    line_fast(ml, mr);
 }
 
 static void draw_track(void) {
     int i;
 
-    /* City first, far to near. Every second segment is enough for the tunnel look. */
-    for (i = SEG_COUNT - 1; i >= 2; i -= 2) {
+    build_road_cache();
+
+    /* Sparse city silhouettes: recognizable, but cheap enough for the eZ80. */
+    for (i = RENDER_SEGMENTS - 2; i >= 3; i -= 4) {
         int16_t z = segment_z((uint8_t)i);
-        draw_tower_grid(&segments[i], z, false);
-        draw_tower_grid(&segments[i], z, true);
+        draw_tower_front(&segments[i], z, false);
+        draw_tower_front(&segments[i], z, true);
     }
 
-    for (i = SEG_COUNT - 2; i >= 0; --i) {
-        const Segment *a = &segments[i];
-        const Segment *b = &segments[i + 1];
-        int16_t z0 = segment_z((uint8_t)i);
-        int16_t z1 = segment_z((uint8_t)(i + 1));
-        ScreenPoint l0, r0, l1, r1;
-        int lane;
+    for (i = RENDER_SEGMENTS - 1; i >= 0; --i) {
+        const RoadProjection *a = &road_cache[i];
+        const RoadProjection *b = &road_cache[i + 1];
+        uint8_t lane;
+        if (!segments[i].solid || !a->valid || !b->valid) continue;
 
-        if (!a->solid || z1 < 7 || z0 > 455) continue;
-        if (z0 < 7) z0 = 7;
-
-        l0 = project_point((int16_t)(a->center_x - a->half_width), a->height, z0);
-        r0 = project_point((int16_t)(a->center_x + a->half_width), a->height, z0);
-        l1 = project_point((int16_t)(b->center_x - b->half_width), b->height, z1);
-        r1 = project_point((int16_t)(b->center_x + b->half_width), b->height, z1);
-        if (!l0.visible && !r0.visible && !l1.visible && !r1.visible) continue;
-
-        /* Original Slope is black roadway bounded by luminous green grid lines. */
-        fill_quad(l0, r0, r1, l1, C_BLACK);
-
-        gfx_SetColor(C_GREEN);
-        gfx_Line(l0.x, l0.y, l1.x, l1.y);
-        gfx_Line(r0.x, r0.y, r1.x, r1.y);
-        gfx_SetColor(C_GRID_DIM);
-        gfx_Line(l1.x, l1.y, r1.x, r1.y);
-
-        /* Longitudinal grid bands (roughly three lanes plus edges). */
-        for (lane = 1; lane <= 3; ++lane) {
-            int16_t ax = (int16_t)(a->center_x - a->half_width + (2 * a->half_width * lane) / 4);
-            int16_t bx = (int16_t)(b->center_x - b->half_width + (2 * b->half_width * lane) / 4);
-            ScreenPoint p0 = project_point(ax, (int16_t)(a->height + 1), z0);
-            ScreenPoint p1 = project_point(bx, (int16_t)(b->height + 1), z1);
-            gfx_SetColor(lane == 2 ? C_GREEN : C_GRID_DIM);
-            gfx_Line(p0.x, p0.y, p1.x, p1.y);
+        /* Five longitudinal wires give the road its original neon-grid look. */
+        for (lane = 0; lane < 5; ++lane) {
+            gfx_SetColor(lane == 0 || lane == 4 || lane == 2 ? C_GREEN : C_GRID_DIM);
+            line_fast(a->p[lane], b->p[lane]);
         }
 
-        if (a->ramp) {
-            ScreenPoint rl = project_point((int16_t)(a->center_x - a->half_width), (int16_t)(a->height + 2), z0);
-            ScreenPoint rr = project_point((int16_t)(a->center_x + a->half_width), (int16_t)(a->height + 2), z0);
+        /* Crossbars only every other slab: about half the line work. */
+        if ((i & 1) == 0) {
+            gfx_SetColor(C_GRID_DIM);
+            line_fast(b->p[0], b->p[4]);
+        }
+
+        if (segments[i].ramp) {
             gfx_SetColor(C_GREEN_BRIGHT);
-            gfx_Line(rl.x, rl.y, rr.x, rr.y);
+            line_fast(a->p[0], a->p[4]);
         }
     }
 }
 
-static void draw_box_at(const Segment *s, int16_t z, uint8_t lane) {
-    int16_t cx = (int16_t)(s->center_x + ((int16_t)lane - 1) * LANE_SPACING);
-    int16_t hw = (int16_t)(s->obstacle_size / 2);
-    int16_t h = (int16_t)(s->obstacle_size + 2);
-    int16_t d = (int16_t)(s->obstacle_size / 2 + 3);
-    ScreenPoint fbl, fbr, ftl, ftr, bbl, bbr, btl, btr;
+static void draw_box_fast(const Segment *s, int16_t z, uint8_t lane) {
+    int16_t cx, hw, h, d;
+    ScreenPoint fbl, fbr, ftl, ftr, btl, btr;
 
-    if (z < 10 || z > 430) return;
+    if (z < 12 || z > 330) return;
+    cx = (int16_t)(s->center_x + ((int16_t)lane - 1) * LANE_SPACING);
+    hw = (int16_t)(s->obstacle_size >> 1);
+    h = (int16_t)(s->obstacle_size + 2);
+    d = (int16_t)(s->obstacle_size / 2 + 3);
+
     fbl = project_point((int16_t)(cx - hw), s->height, (int16_t)(z - d));
     fbr = project_point((int16_t)(cx + hw), s->height, (int16_t)(z - d));
     ftl = project_point((int16_t)(cx - hw), (int16_t)(s->height + h), (int16_t)(z - d));
     ftr = project_point((int16_t)(cx + hw), (int16_t)(s->height + h), (int16_t)(z - d));
-    bbl = project_point((int16_t)(cx - hw), s->height, (int16_t)(z + d));
-    bbr = project_point((int16_t)(cx + hw), s->height, (int16_t)(z + d));
     btl = project_point((int16_t)(cx - hw), (int16_t)(s->height + h), (int16_t)(z + d));
     btr = project_point((int16_t)(cx + hw), (int16_t)(s->height + h), (int16_t)(z + d));
 
-    fill_quad(ftl, ftr, fbr, fbl, C_BLACK);
-    gfx_SetColor(C_RED_DIM);
-    gfx_Line(ftl.x, ftl.y, btl.x, btl.y);
-    gfx_Line(ftr.x, ftr.y, btr.x, btr.y);
-    gfx_Line(fbl.x, fbl.y, bbl.x, bbl.y);
-    gfx_Line(fbr.x, fbr.y, bbr.x, bbr.y);
     gfx_SetColor(C_RED);
-    gfx_Line(ftl.x, ftl.y, ftr.x, ftr.y);
-    gfx_Line(ftr.x, ftr.y, fbr.x, fbr.y);
-    gfx_Line(fbr.x, fbr.y, fbl.x, fbl.y);
-    gfx_Line(fbl.x, fbl.y, ftl.x, ftl.y);
-    gfx_SetColor(C_RED_BRIGHT);
-    gfx_Line(ftl.x, ftl.y, ftr.x, ftr.y);
+    line_fast(ftl, ftr);
+    line_fast(ftr, fbr);
+    line_fast(fbr, fbl);
+    line_fast(fbl, ftl);
+    gfx_SetColor(C_RED_DIM);
+    line_fast(ftl, btl);
+    line_fast(ftr, btr);
+    line_fast(btl, btr);
 }
 
 static void draw_obstacles(void) {
     int i;
-    for (i = SEG_COUNT - 1; i >= 0; --i) {
+    for (i = RENDER_SEGMENTS - 1; i >= 0; --i) {
         uint8_t lane;
         if (!segments[i].solid || segments[i].obstacle_mask == 0) continue;
         for (lane = 0; lane < 3; ++lane) {
             if (segments[i].obstacle_mask & (1U << lane)) {
-                draw_box_at(&segments[i], segment_z((uint8_t)i), lane);
+                draw_box_fast(&segments[i], segment_z((uint8_t)i), lane);
             }
         }
     }
@@ -600,40 +599,31 @@ static void draw_ball(void) {
     int16_t world_x = (int16_t)(player_x_q8 >> 8);
     int16_t world_y = (int16_t)(ball_y_q8 >> 8);
     ScreenPoint p = project_point(world_x, world_y, BALL_Z);
-    int radius = (BALL_RADIUS * FOCAL_X) / BALL_Z;
+    int radius = 11;
+    int phase = (int)((roll_phase >> 1) & 7U) - 3;
     int16_t center, ground_h, half_w;
     bool solid, ramp;
     ScreenPoint shadow;
-    int offset;
-
-    (void)center;
-    (void)half_w;
-    (void)solid;
-    (void)ramp;
-    if (radius < 10) radius = 10;
-    if (radius > 18) radius = 18;
 
     sample_track_at_ball(&center, &ground_h, &half_w, &solid, &ramp);
     shadow = project_point(world_x, (int16_t)(ground_h + 1), BALL_Z);
-    gfx_SetColor(C_SHADOW);
-    gfx_FillEllipse(shadow.x, shadow.y + 3, radius + 4, radius / 2);
 
-    /* Black sphere with luminous green latitude/longitude bands. */
+    /* Circle/straight chords are dramatically cheaper than multiple ellipses. */
+    gfx_SetColor(C_SHADOW);
+    gfx_FillCircle(shadow.x, shadow.y + 3, 7);
     gfx_SetColor(C_BALL_DARK);
-    gfx_FillCircle(p.x, p.y, radius + 1);
+    gfx_FillCircle(p.x, p.y, radius);
     gfx_SetColor(C_GREEN_BRIGHT);
     gfx_Circle(p.x, p.y, radius);
-
-    offset = (int)((roll_phase & 15U) - 8);
     gfx_SetColor(C_GREEN);
-    gfx_Ellipse(p.x, p.y, (radius * 2) / 3, radius);
-    gfx_Ellipse(p.x, p.y, radius, radius / 2);
-    gfx_Line(p.x - radius + 2, p.y + offset / 2,
-             p.x + radius - 2, p.y - offset / 2);
-    gfx_Line(p.x - offset / 2, p.y - radius + 2,
-             p.x + offset / 2, p.y + radius - 2);
-    gfx_SetColor(C_GREEN_BRIGHT);
-    gfx_FillCircle(p.x - radius / 3, p.y - radius / 3, 2);
+    gfx_Line(p.x - radius + 2, p.y + phase,
+             p.x + radius - 2, p.y - phase);
+    gfx_Line(p.x - radius + 3, p.y - 4,
+             p.x + radius - 3, p.y - 4);
+    gfx_Line(p.x - radius + 3, p.y + 4,
+             p.x + radius - 3, p.y + 4);
+    gfx_Line(p.x + phase, p.y - radius + 2,
+             p.x - phase, p.y + radius - 2);
 }
 
 static unsigned score_digits(uint32_t v) {
@@ -664,7 +654,7 @@ static void draw_title(void) {
     gfx_SetTextFGColor(C_WHITE);
     gfx_PrintStringXY("TI-84 PLUS CE", 106, 105);
     gfx_SetTextFGColor(C_GREEN);
-    gfx_PrintStringXY("NEON NATIVE PORT", 95, 121);
+    gfx_PrintStringXY("FAST NATIVE PORT", 92, 121);
     gfx_SetTextFGColor(C_WHITE);
     gfx_PrintStringXY("LEFT / RIGHT TO STEER", 75, 158);
     gfx_PrintStringXY("[2nd] OR [enter] TO START", 58, 178);
@@ -746,6 +736,7 @@ int main(void) {
     bool save_needed = false;
 
     load_high_score();
+    init_projection();
     gfx_Begin();
     gfx_SetDrawBuffer();
     init_palette();
@@ -798,7 +789,8 @@ int main(void) {
         }
 
         render();
-        delay(25);
+        /* Render cost now dominates pacing far less; keep gameplay near 40 Hz. */
+        delay(20);
     }
 
     gfx_End();
