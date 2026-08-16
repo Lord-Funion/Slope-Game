@@ -30,3 +30,9 @@ jobs:
         run: make -j2
       - name: Show build output
         run: ls -lh ti84ce/bin/
+      - name: Upload calculator program
+        uses: actions/upload-artifact@v4
+        with:
+          name: SLOPECE
+          path: ti84ce/bin/SLOPECE.8xp
+          if-no-files-found: error
