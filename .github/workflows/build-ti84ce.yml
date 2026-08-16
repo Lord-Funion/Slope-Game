@@ -1,0 +1,38 @@
+name: Build TI-84 Plus CE port
+
+on:
+  push:
+    branches: [main, "ti84ce-native-slope"]
+    paths:
+      - "ti84ce/**"
+      - ".github/workflows/build-ti84ce.yml"
+  pull_request:
+    paths:
+      - "ti84ce/**"
+      - ".github/workflows/build-ti84ce.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CEdev v15.0
+        run: |
+          curl -L --fail -o /tmp/cedev.tar.gz https://github.com/CE-Programming/toolchain/releases/download/v15.0/CEdev-Linux.tar.gz
+          mkdir -p "$HOME/CEdev"
+          tar -xzf /tmp/cedev.tar.gz -C "$HOME/CEdev" --strip-components=1
+          echo "$HOME/CEdev/bin" >> "$GITHUB_PATH"
+      - name: Build Slope CE Native
+        working-directory: ti84ce
+        run: make -j2
+      - name: Show build output
+        run: ls -lh ti84ce/bin/
+      - name: Upload calculator program
+        uses: actions/upload-artifact@v4
+        with:
+          name: SLOPECE
+          path: ti84ce/bin/SLOPECE.8xp
+          if-no-files-found: error
