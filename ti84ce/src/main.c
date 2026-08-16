@@ -8,47 +8,47 @@
 #include <tice.h>
 
 /*
- * Slope CE Native
- * A from-scratch TI-84 Plus CE implementation of the Slope gameplay loop.
+ * Slope CE Native -- fidelity pass
  *
- * Rendering is intentionally integer/fixed-point only. The calculator has no GPU,
- * so the road, obstacles, skyline, ball and lighting are generated from primitives.
+ * Native fixed-point recreation of the classic Unity/WebGL Slope look and
+ * gameplay. The CE cannot execute the Unity build itself, so this renderer
+ * spends its frame budget on the recognizable parts: black geometry with
+ * neon green/red wireframes, a gridded rolling ball, perspective city walls,
+ * procedural downhill track, ramps/gaps, inertial steering and speed ramping.
  */
 
 #define SCREEN_W 320
 #define SCREEN_H 240
-#define HORIZON_Y 66
-#define FOCAL_X 92
-#define FOCAL_Y 104
-#define CAMERA_HEIGHT 38
-#define NEAR_Z 18
-#define BALL_Z 42
-#define SEG_LEN 14
-#define SEG_COUNT 30
+#define HORIZON_Y 54
+#define FOCAL_X 102
+#define FOCAL_Y 112
+#define CAMERA_HEIGHT 39
+#define NEAR_Z 16
+#define BALL_Z 43
+#define SEG_LEN 13
+#define SEG_COUNT 32
 #define Q 256
 
-#define TRACK_HALF_W 28
-#define BALL_RADIUS 4
-#define MAX_LATERAL_V 820
-#define START_SPEED 310
-#define MAX_SPEED 740
+#define TRACK_HALF_W 29
+#define BALL_RADIUS 5
+#define MAX_LATERAL_V 840
+#define START_SPEED 300
+#define MAX_SPEED 760
+#define LANE_SPACING 14
 
 #define SAVE_NAME "SLOPEHS"
 #define SAVE_MAGIC 0x534C5045UL
 
 enum {
     C_BLACK = 0,
-    C_BG_GREEN,
+    C_VOID_GREEN,
     C_GRID_DIM,
-    C_TRACK_DARK,
-    C_TRACK,
-    C_TRACK_BRIGHT,
-    C_RED_DARK,
+    C_GREEN,
+    C_GREEN_BRIGHT,
+    C_RED_DIM,
     C_RED,
     C_RED_BRIGHT,
     C_BALL_DARK,
-    C_BALL,
-    C_BALL_BRIGHT,
     C_WHITE,
     C_GREY,
     C_SHADOW,
@@ -68,7 +68,7 @@ typedef struct {
     uint8_t half_width;
     uint8_t solid;
     uint8_t ramp;
-    int8_t obstacle_lane;
+    uint8_t obstacle_mask; /* bit 0 left, bit 1 center, bit 2 right */
     uint8_t obstacle_size;
     uint8_t left_tower;
     uint8_t right_tower;
@@ -87,9 +87,10 @@ typedef struct {
 
 static Segment segments[SEG_COUNT];
 static uint32_t rng_state = 0x9E3779B9UL;
-static int16_t generation_curve = 0;
-static int16_t generation_height_velocity = 0;
-static uint8_t generation_cooldown = 0;
+static int16_t generation_curve;
+static int16_t generation_height_velocity;
+static uint8_t generation_cooldown;
+static uint8_t generation_narrow_timer;
 
 static int32_t player_x_q8;
 static int32_t player_vx_q8;
@@ -135,20 +136,17 @@ static int32_t clamp32(int32_t v, int32_t lo, int32_t hi) {
 
 static void init_palette(void) {
     gfx_palette[C_BLACK]        = gfx_RGBTo1555(0, 0, 0);
-    gfx_palette[C_BG_GREEN]     = gfx_RGBTo1555(0, 32, 20);
-    gfx_palette[C_GRID_DIM]     = gfx_RGBTo1555(0, 74, 43);
-    gfx_palette[C_TRACK_DARK]   = gfx_RGBTo1555(0, 92, 45);
-    gfx_palette[C_TRACK]        = gfx_RGBTo1555(0, 178, 82);
-    gfx_palette[C_TRACK_BRIGHT] = gfx_RGBTo1555(52, 255, 136);
-    gfx_palette[C_RED_DARK]     = gfx_RGBTo1555(96, 0, 10);
-    gfx_palette[C_RED]          = gfx_RGBTo1555(220, 16, 38);
-    gfx_palette[C_RED_BRIGHT]   = gfx_RGBTo1555(255, 92, 102);
-    gfx_palette[C_BALL_DARK]    = gfx_RGBTo1555(0, 92, 45);
-    gfx_palette[C_BALL]         = gfx_RGBTo1555(34, 230, 116);
-    gfx_palette[C_BALL_BRIGHT]  = gfx_RGBTo1555(166, 255, 204);
-    gfx_palette[C_WHITE]        = gfx_RGBTo1555(255, 255, 255);
-    gfx_palette[C_GREY]         = gfx_RGBTo1555(118, 135, 127);
-    gfx_palette[C_SHADOW]       = gfx_RGBTo1555(0, 30, 18);
+    gfx_palette[C_VOID_GREEN]   = gfx_RGBTo1555(0, 18, 9);
+    gfx_palette[C_GRID_DIM]     = gfx_RGBTo1555(0, 86, 35);
+    gfx_palette[C_GREEN]        = gfx_RGBTo1555(0, 218, 70);
+    gfx_palette[C_GREEN_BRIGHT] = gfx_RGBTo1555(73, 255, 113);
+    gfx_palette[C_RED_DIM]      = gfx_RGBTo1555(74, 0, 8);
+    gfx_palette[C_RED]          = gfx_RGBTo1555(216, 10, 28);
+    gfx_palette[C_RED_BRIGHT]   = gfx_RGBTo1555(255, 54, 69);
+    gfx_palette[C_BALL_DARK]    = gfx_RGBTo1555(0, 25, 10);
+    gfx_palette[C_WHITE]        = gfx_RGBTo1555(245, 255, 248);
+    gfx_palette[C_GREY]         = gfx_RGBTo1555(95, 112, 101);
+    gfx_palette[C_SHADOW]       = gfx_RGBTo1555(0, 8, 3);
 }
 
 static void load_high_score(void) {
@@ -175,22 +173,39 @@ static void save_high_score(void) {
     ti_Close(handle);
 }
 
+static uint8_t random_obstacle_mask(uint32_t r) {
+    uint8_t pattern = (uint8_t)((r >> 18) & 7U);
+    switch (pattern) {
+        case 0: return 0x01;
+        case 1: return 0x02;
+        case 2: return 0x04;
+        case 3: return 0x03;
+        case 4: return 0x06;
+        case 5: return 0x05;
+        default: return (uint8_t)(1U << (r % 3U));
+    }
+}
+
 static void generate_segment(Segment *out, const Segment *prev, uint8_t index_from_start) {
     uint32_t r = rand32();
     int16_t cx = prev->center_x;
     int16_t h = prev->height;
 
-    if ((r & 31U) == 0U) generation_curve += (int16_t)(((r >> 8) & 1U) ? 2 : -2);
+    /* Smooth-ish turns: change curvature rarely, then carry it forward. */
+    if ((r & 31U) == 0U) {
+        generation_curve += (int16_t)(((r >> 8) & 1U) ? 1 : -1);
+    }
+    if ((r & 127U) == 17U) generation_curve = 0;
     generation_curve = clamp16(generation_curve, -4, 4);
-    if ((r & 127U) == 3U) generation_curve = 0;
-    cx = clamp16((int16_t)(cx + generation_curve), -54, 54);
+    cx = clamp16((int16_t)(cx + generation_curve), -58, 58);
 
+    /* Long rises/drops instead of one-segment vertical noise. */
     if (((r >> 4) & 63U) == 7U && generation_height_velocity == 0) {
         generation_height_velocity = (int16_t)(((r >> 15) & 1U) ? 2 : -2);
     }
     if (generation_height_velocity != 0) {
         h = (int16_t)(h + generation_height_velocity);
-        if (h > 18 || h < -12 || ((r >> 10) & 7U) == 0U) generation_height_velocity = 0;
+        if (h > 20 || h < -14 || ((r >> 10) & 7U) == 0U) generation_height_velocity = 0;
     }
 
     out->center_x = cx;
@@ -198,20 +213,25 @@ static void generate_segment(Segment *out, const Segment *prev, uint8_t index_fr
     out->half_width = TRACK_HALF_W;
     out->solid = 1;
     out->ramp = 0;
-    out->obstacle_lane = -2;
-    out->obstacle_size = 9;
-    out->left_tower = (uint8_t)(8 + ((r >> 16) & 31U));
-    out->right_tower = (uint8_t)(8 + ((r >> 21) & 31U));
+    out->obstacle_mask = 0;
+    out->obstacle_size = (uint8_t)(9 + ((r >> 5) & 3U));
+    out->left_tower = (uint8_t)(18 + ((r >> 16) & 45U));
+    out->right_tower = (uint8_t)(18 + ((r >> 22) & 45U));
 
-    if (index_from_start > 8 && generation_cooldown == 0) {
+    if (generation_narrow_timer) {
+        out->half_width = (uint8_t)(20 + (generation_narrow_timer & 1U) * 2U);
+        generation_narrow_timer--;
+    }
+
+    if (index_from_start > 7 && generation_cooldown == 0) {
         uint8_t event = (uint8_t)((r >> 24) & 31U);
-        if (event <= 5) {
-            out->obstacle_lane = (int8_t)((r % 3U) - 1);
-            out->obstacle_size = (uint8_t)(8 + ((r >> 5) & 3U));
-            generation_cooldown = 2;
-        } else if (event == 6) {
+        if (event <= 8) {
+            out->obstacle_mask = random_obstacle_mask(r);
+            generation_cooldown = (uint8_t)(2 + ((r >> 11) & 1U));
+        } else if (event == 9) {
+            generation_narrow_timer = 4;
             out->half_width = 20;
-            generation_cooldown = 2;
+            generation_cooldown = 4;
         }
     }
     if (generation_cooldown) generation_cooldown--;
@@ -223,23 +243,25 @@ static void build_initial_track(void) {
     generation_curve = 0;
     generation_height_velocity = 0;
     generation_cooldown = 0;
+    generation_narrow_timer = 0;
 
     segments[0].center_x = 0;
     segments[0].height = 0;
     segments[0].half_width = TRACK_HALF_W;
     segments[0].solid = 1;
-    segments[0].obstacle_lane = -2;
-    segments[0].left_tower = 12;
-    segments[0].right_tower = 16;
+    segments[0].obstacle_mask = 0;
+    segments[0].left_tower = 28;
+    segments[0].right_tower = 34;
 
     for (i = 1; i < SEG_COUNT; ++i) generate_segment(&segments[i], &segments[i - 1], i);
 
-    segments[10].ramp = 1;
-    segments[11].solid = 0;
+    /* A predictable early jump teaches the mechanic before random gaps appear. */
+    segments[11].ramp = 1;
     segments[12].solid = 0;
-    segments[13].solid = 1;
-    segments[11].obstacle_lane = -2;
-    segments[12].obstacle_lane = -2;
+    segments[13].solid = 0;
+    segments[14].solid = 1;
+    segments[12].obstacle_mask = 0;
+    segments[13].obstacle_mask = 0;
 }
 
 static void append_far_segment(void) {
@@ -248,13 +270,17 @@ static void append_far_segment(void) {
     for (i = 0; i < SEG_COUNT - 1; ++i) segments[i] = segments[i + 1];
     generate_segment(&segments[SEG_COUNT - 1], &old_last, SEG_COUNT - 1);
 
-    if ((rand32() & 63U) == 7U && segments[SEG_COUNT - 5].solid && segments[SEG_COUNT - 4].solid) {
-        segments[SEG_COUNT - 5].ramp = 1;
+    /* Gap event: ramp + two empty slabs + landing. */
+    if ((rand32() & 79U) == 9U &&
+        segments[SEG_COUNT - 6].solid && segments[SEG_COUNT - 5].solid &&
+        segments[SEG_COUNT - 4].solid) {
+        segments[SEG_COUNT - 6].ramp = 1;
+        segments[SEG_COUNT - 5].solid = 0;
         segments[SEG_COUNT - 4].solid = 0;
-        segments[SEG_COUNT - 3].solid = 0;
-        segments[SEG_COUNT - 4].obstacle_lane = -2;
-        segments[SEG_COUNT - 3].obstacle_lane = -2;
-        segments[SEG_COUNT - 2].solid = 1;
+        segments[SEG_COUNT - 5].obstacle_mask = 0;
+        segments[SEG_COUNT - 4].obstacle_mask = 0;
+        segments[SEG_COUNT - 3].solid = 1;
+        segments[SEG_COUNT - 3].obstacle_mask = 0;
     }
 }
 
@@ -287,7 +313,7 @@ static ScreenPoint project_point(int16_t world_x, int16_t world_y, int16_t z) {
     rel_x = ((int32_t)world_x * Q) - camera_x_q8;
     p.x = (SCREEN_W / 2) + (int)(rel_x * FOCAL_X / ((int32_t)z * Q));
     p.y = HORIZON_Y + (int)(((int32_t)(CAMERA_HEIGHT - world_y) * FOCAL_Y) / z);
-    p.visible = p.x > -80 && p.x < SCREEN_W + 80 && p.y > -80 && p.y < SCREEN_H + 80;
+    p.visible = p.x > -96 && p.x < SCREEN_W + 96 && p.y > -96 && p.y < SCREEN_H + 96;
     return p;
 }
 
@@ -305,7 +331,8 @@ static uint8_t ball_segment_index(uint8_t *frac_out) {
     return idx;
 }
 
-static void sample_track_at_ball(int16_t *center, int16_t *height, int16_t *half_width, bool *solid, bool *ramp) {
+static void sample_track_at_ball(int16_t *center, int16_t *height, int16_t *half_width,
+                                 bool *solid, bool *ramp) {
     uint8_t frac;
     uint8_t idx = ball_segment_index(&frac);
     const Segment *a = &segments[idx];
@@ -326,18 +353,24 @@ static void check_obstacle_collision(void) {
     uint8_t i;
     for (i = 0; i < SEG_COUNT; ++i) {
         const Segment *s = &segments[i];
-        int16_t z, obstacle_x, dx, ball_bottom;
-        if (!s->solid || s->obstacle_lane < -1) continue;
+        int16_t z;
+        uint8_t lane;
+        if (!s->solid || s->obstacle_mask == 0) continue;
         z = segment_z(i);
-        if (z < BALL_Z - 5 || z > BALL_Z + 5) continue;
-        obstacle_x = (int16_t)(s->center_x + s->obstacle_lane * 13);
-        dx = (int16_t)((player_x_q8 >> 8) - obstacle_x);
-        if (dx < 0) dx = (int16_t)-dx;
-        ball_bottom = (int16_t)((ball_y_q8 >> 8) - BALL_RADIUS);
-        if (dx <= (int16_t)(s->obstacle_size / 2 + BALL_RADIUS) &&
-            ball_bottom < (int16_t)(s->height + s->obstacle_size)) {
-            die();
-            return;
+        if (z < BALL_Z - 6 || z > BALL_Z + 6) continue;
+
+        for (lane = 0; lane < 3; ++lane) {
+            int16_t obstacle_x, dx, ball_bottom;
+            if ((s->obstacle_mask & (1U << lane)) == 0) continue;
+            obstacle_x = (int16_t)(s->center_x + ((int16_t)lane - 1) * LANE_SPACING);
+            dx = (int16_t)((player_x_q8 >> 8) - obstacle_x);
+            if (dx < 0) dx = (int16_t)-dx;
+            ball_bottom = (int16_t)((ball_y_q8 >> 8) - BALL_RADIUS);
+            if (dx <= (int16_t)(s->obstacle_size / 2 + BALL_RADIUS) &&
+                ball_bottom < (int16_t)(s->height + s->obstacle_size + 2)) {
+                die();
+                return;
+            }
         }
     }
 }
@@ -346,9 +379,10 @@ static void update_game(bool left, bool right) {
     int16_t center, ground_h, half_w, px, ball_bottom;
     bool solid, ramp;
 
-    if (left && !right) player_vx_q8 -= 58;
-    if (right && !left) player_vx_q8 += 58;
-    player_vx_q8 = (player_vx_q8 * 232) >> 8;
+    /* Deliberately inertial: tapping nudges the ball; holding builds a slide. */
+    if (left && !right) player_vx_q8 -= 55;
+    if (right && !left) player_vx_q8 += 55;
+    player_vx_q8 = (player_vx_q8 * 234) >> 8;
     player_vx_q8 = clamp32(player_vx_q8, -MAX_LATERAL_V, MAX_LATERAL_V);
     player_x_q8 += player_vx_q8;
     camera_x_q8 += (player_x_q8 - camera_x_q8) >> 4;
@@ -362,9 +396,9 @@ static void update_game(bool left, bool right) {
     }
 
     score = distance_q8 / (Q * 10UL);
-    speed_q8 = (uint16_t)(START_SPEED + (score > 215 ? 430 : score * 2));
+    speed_q8 = (uint16_t)(START_SPEED + (score > 230 ? 460 : score * 2));
     if (speed_q8 > MAX_SPEED) speed_q8 = MAX_SPEED;
-    roll_phase = (uint8_t)(roll_phase + (speed_q8 >> 7));
+    roll_phase = (uint8_t)(roll_phase + 2 + (speed_q8 >> 8));
 
     sample_track_at_ball(&center, &ground_h, &half_w, &solid, &ramp);
     px = (int16_t)(player_x_q8 >> 8);
@@ -376,7 +410,7 @@ static void update_game(bool left, bool right) {
         } else {
             ball_y_q8 = (int32_t)(ground_h + BALL_RADIUS) * Q;
             if (ramp && !ramp_consumed) {
-                ball_vy_q8 = 980;
+                ball_vy_q8 = 1000;
                 grounded = false;
                 ramp_consumed = true;
             }
@@ -384,19 +418,19 @@ static void update_game(bool left, bool right) {
     }
 
     if (!grounded) {
-        ball_vy_q8 -= 74;
+        ball_vy_q8 -= 75;
         ball_y_q8 += ball_vy_q8;
         ball_bottom = (int16_t)((ball_y_q8 >> 8) - BALL_RADIUS);
         if (solid && ball_vy_q8 <= 0 &&
             px >= center - half_w + BALL_RADIUS && px <= center + half_w - BALL_RADIUS &&
-            ball_bottom <= ground_h + 2 && ball_bottom >= ground_h - 6) {
+            ball_bottom <= ground_h + 2 && ball_bottom >= ground_h - 7) {
             grounded = true;
             ball_vy_q8 = 0;
             ball_y_q8 = (int32_t)(ground_h + BALL_RADIUS) * Q;
         }
     }
 
-    if ((ball_y_q8 >> 8) < -28) {
+    if ((ball_y_q8 >> 8) < -32) {
         die();
         return;
     }
@@ -410,57 +444,66 @@ static void fill_quad(ScreenPoint a, ScreenPoint b, ScreenPoint c, ScreenPoint d
 }
 
 static void draw_background(void) {
-    uint8_t i;
     gfx_FillScreen(C_BLACK);
-    gfx_SetColor(C_BG_GREEN);
+    gfx_SetColor(C_VOID_GREEN);
     gfx_HorizLine(0, HORIZON_Y, SCREEN_W);
-    gfx_SetColor(C_GRID_DIM);
-    for (i = 0; i < 9; ++i) {
-        int x = 20 + i * 35;
-        gfx_Line(SCREEN_W / 2, HORIZON_Y, x, SCREEN_H - 1);
-    }
-    for (i = 0; i < 5; ++i) {
-        int y = HORIZON_Y + 12 + i * i * 7;
-        if (y < SCREEN_H) gfx_HorizLine(0, y, SCREEN_W);
-    }
 }
 
-static void draw_tower(const Segment *s, int16_t z, bool right_side) {
-    int16_t base_x = (int16_t)(s->center_x + (right_side ? s->half_width + 42 : -s->half_width - 42));
+static void draw_tower_grid(const Segment *s, int16_t z, bool right_side) {
+    int16_t side = right_side ? 1 : -1;
+    int16_t base_x = (int16_t)(s->center_x + side * (s->half_width + 38));
     int16_t h = right_side ? s->right_tower : s->left_tower;
-    int16_t w = 12, depth = 6;
-    ScreenPoint bl, br, tl, tr, bl2, br2, tl2, tr2;
-    if (z < 12) return;
-    bl = project_point((int16_t)(base_x - w), s->height, z);
-    br = project_point((int16_t)(base_x + w), s->height, z);
-    tl = project_point((int16_t)(base_x - w), (int16_t)(s->height + h), z);
-    tr = project_point((int16_t)(base_x + w), (int16_t)(s->height + h), z);
-    bl2 = project_point((int16_t)(base_x - w), s->height, (int16_t)(z + depth));
-    br2 = project_point((int16_t)(base_x + w), s->height, (int16_t)(z + depth));
-    tl2 = project_point((int16_t)(base_x - w), (int16_t)(s->height + h), (int16_t)(z + depth));
-    tr2 = project_point((int16_t)(base_x + w), (int16_t)(s->height + h), (int16_t)(z + depth));
-    if (!bl.visible && !br.visible && !tl.visible && !tr.visible) return;
+    int16_t hw = 11;
+    int16_t depth = 10;
+    ScreenPoint fbl, fbr, ftl, ftr, btl, btr, bbl, bbr;
+    int16_t y;
 
-    fill_quad(tl, tr, br, bl, C_BG_GREEN);
-    fill_quad(tl2, tr2, tr, tl, C_TRACK_DARK);
+    if (z < 18 || z > 390) return;
+
+    fbl = project_point((int16_t)(base_x - hw), s->height, (int16_t)(z - depth));
+    fbr = project_point((int16_t)(base_x + hw), s->height, (int16_t)(z - depth));
+    ftl = project_point((int16_t)(base_x - hw), (int16_t)(s->height + h), (int16_t)(z - depth));
+    ftr = project_point((int16_t)(base_x + hw), (int16_t)(s->height + h), (int16_t)(z - depth));
+    bbl = project_point((int16_t)(base_x - hw), s->height, (int16_t)(z + depth));
+    bbr = project_point((int16_t)(base_x + hw), s->height, (int16_t)(z + depth));
+    btl = project_point((int16_t)(base_x - hw), (int16_t)(s->height + h), (int16_t)(z + depth));
+    btr = project_point((int16_t)(base_x + hw), (int16_t)(s->height + h), (int16_t)(z + depth));
+
+    if (!ftl.visible && !ftr.visible && !fbl.visible && !fbr.visible) return;
+
+    fill_quad(ftl, ftr, fbr, fbl, C_BLACK);
     gfx_SetColor(C_GRID_DIM);
-    gfx_Line(tl.x, tl.y, tr.x, tr.y);
-    gfx_Line(tr.x, tr.y, br.x, br.y);
-    gfx_Line(bl.x, bl.y, tl.x, tl.y);
-    gfx_Line(tl2.x, tl2.y, tl.x, tl.y);
-    gfx_Line(tr2.x, tr2.y, tr.x, tr.y);
-    gfx_Line(bl2.x, bl2.y, bl.x, bl.y);
-    gfx_Line(br2.x, br2.y, br.x, br.y);
+    gfx_Line(ftl.x, ftl.y, ftr.x, ftr.y);
+    gfx_Line(ftr.x, ftr.y, fbr.x, fbr.y);
+    gfx_Line(fbr.x, fbr.y, fbl.x, fbl.y);
+    gfx_Line(fbl.x, fbl.y, ftl.x, ftl.y);
+    gfx_Line(ftl.x, ftl.y, btl.x, btl.y);
+    gfx_Line(ftr.x, ftr.y, btr.x, btr.y);
+    gfx_Line(fbl.x, fbl.y, bbl.x, bbl.y);
+    gfx_Line(fbr.x, fbr.y, bbr.x, bbr.y);
+
+    /* sparse windows/grid keeps the city recognizable without crushing FPS */
+    for (y = 10; y < h; y += 10) {
+        ScreenPoint l = project_point((int16_t)(base_x - hw), (int16_t)(s->height + y), (int16_t)(z - depth));
+        ScreenPoint r = project_point((int16_t)(base_x + hw), (int16_t)(s->height + y), (int16_t)(z - depth));
+        gfx_Line(l.x, l.y, r.x, r.y);
+    }
+
+    {
+        ScreenPoint mt = project_point(base_x, (int16_t)(s->height + h), (int16_t)(z - depth));
+        ScreenPoint mb = project_point(base_x, s->height, (int16_t)(z - depth));
+        gfx_Line(mt.x, mt.y, mb.x, mb.y);
+    }
 }
 
 static void draw_track(void) {
     int i;
-    for (i = SEG_COUNT - 1; i >= 1; --i) {
+
+    /* City first, far to near. Every second segment is enough for the tunnel look. */
+    for (i = SEG_COUNT - 1; i >= 2; i -= 2) {
         int16_t z = segment_z((uint8_t)i);
-        if (z > 10) {
-            draw_tower(&segments[i], z, false);
-            draw_tower(&segments[i], z, true);
-        }
+        draw_tower_grid(&segments[i], z, false);
+        draw_tower_grid(&segments[i], z, true);
     }
 
     for (i = SEG_COUNT - 2; i >= 0; --i) {
@@ -469,8 +512,9 @@ static void draw_track(void) {
         int16_t z0 = segment_z((uint8_t)i);
         int16_t z1 = segment_z((uint8_t)(i + 1));
         ScreenPoint l0, r0, l1, r1;
-        uint8_t base;
-        if (!a->solid || z1 < 7 || z0 > 460) continue;
+        int lane;
+
+        if (!a->solid || z1 < 7 || z0 > 455) continue;
         if (z0 < 7) z0 = 7;
 
         l0 = project_point((int16_t)(a->center_x - a->half_width), a->height, z0);
@@ -479,50 +523,76 @@ static void draw_track(void) {
         r1 = project_point((int16_t)(b->center_x + b->half_width), b->height, z1);
         if (!l0.visible && !r0.visible && !l1.visible && !r1.visible) continue;
 
-        base = ((i + (scroll_q8 >> 9)) & 1) ? C_TRACK_DARK : C_TRACK;
-        fill_quad(l0, r0, r1, l1, base);
-        gfx_SetColor(C_TRACK_BRIGHT);
+        /* Original Slope is black roadway bounded by luminous green grid lines. */
+        fill_quad(l0, r0, r1, l1, C_BLACK);
+
+        gfx_SetColor(C_GREEN);
         gfx_Line(l0.x, l0.y, l1.x, l1.y);
         gfx_Line(r0.x, r0.y, r1.x, r1.y);
         gfx_SetColor(C_GRID_DIM);
         gfx_Line(l1.x, l1.y, r1.x, r1.y);
 
-        if ((i & 1) == 0) {
-            ScreenPoint m0 = project_point(a->center_x, (int16_t)(a->height + 1), z0);
-            ScreenPoint m1 = project_point(b->center_x, (int16_t)(b->height + 1), z1);
-            gfx_SetColor(C_TRACK_BRIGHT);
-            gfx_Line(m0.x, m0.y, m1.x, m1.y);
+        /* Longitudinal grid bands (roughly three lanes plus edges). */
+        for (lane = 1; lane <= 3; ++lane) {
+            int16_t ax = (int16_t)(a->center_x - a->half_width + (2 * a->half_width * lane) / 4);
+            int16_t bx = (int16_t)(b->center_x - b->half_width + (2 * b->half_width * lane) / 4);
+            ScreenPoint p0 = project_point(ax, (int16_t)(a->height + 1), z0);
+            ScreenPoint p1 = project_point(bx, (int16_t)(b->height + 1), z1);
+            gfx_SetColor(lane == 2 ? C_GREEN : C_GRID_DIM);
+            gfx_Line(p0.x, p0.y, p1.x, p1.y);
+        }
+
+        if (a->ramp) {
+            ScreenPoint rl = project_point((int16_t)(a->center_x - a->half_width), (int16_t)(a->height + 2), z0);
+            ScreenPoint rr = project_point((int16_t)(a->center_x + a->half_width), (int16_t)(a->height + 2), z0);
+            gfx_SetColor(C_GREEN_BRIGHT);
+            gfx_Line(rl.x, rl.y, rr.x, rr.y);
         }
     }
 }
 
-static void draw_box(const Segment *s, int16_t z) {
-    int16_t cx = (int16_t)(s->center_x + s->obstacle_lane * 13);
+static void draw_box_at(const Segment *s, int16_t z, uint8_t lane) {
+    int16_t cx = (int16_t)(s->center_x + ((int16_t)lane - 1) * LANE_SPACING);
     int16_t hw = (int16_t)(s->obstacle_size / 2);
-    int16_t h = s->obstacle_size;
-    int16_t d = (int16_t)(s->obstacle_size / 2 + 2);
-    ScreenPoint fbl, fbr, ftl, ftr, bbr, btl, btr;
-    if (z < 8) return;
+    int16_t h = (int16_t)(s->obstacle_size + 2);
+    int16_t d = (int16_t)(s->obstacle_size / 2 + 3);
+    ScreenPoint fbl, fbr, ftl, ftr, bbl, bbr, btl, btr;
+
+    if (z < 10 || z > 430) return;
     fbl = project_point((int16_t)(cx - hw), s->height, (int16_t)(z - d));
     fbr = project_point((int16_t)(cx + hw), s->height, (int16_t)(z - d));
     ftl = project_point((int16_t)(cx - hw), (int16_t)(s->height + h), (int16_t)(z - d));
     ftr = project_point((int16_t)(cx + hw), (int16_t)(s->height + h), (int16_t)(z - d));
+    bbl = project_point((int16_t)(cx - hw), s->height, (int16_t)(z + d));
     bbr = project_point((int16_t)(cx + hw), s->height, (int16_t)(z + d));
     btl = project_point((int16_t)(cx - hw), (int16_t)(s->height + h), (int16_t)(z + d));
     btr = project_point((int16_t)(cx + hw), (int16_t)(s->height + h), (int16_t)(z + d));
 
-    fill_quad(ftl, ftr, fbr, fbl, C_RED);
-    fill_quad(btl, btr, ftr, ftl, C_RED_BRIGHT);
-    fill_quad(ftr, btr, bbr, fbr, C_RED_DARK);
+    fill_quad(ftl, ftr, fbr, fbl, C_BLACK);
+    gfx_SetColor(C_RED_DIM);
+    gfx_Line(ftl.x, ftl.y, btl.x, btl.y);
+    gfx_Line(ftr.x, ftr.y, btr.x, btr.y);
+    gfx_Line(fbl.x, fbl.y, bbl.x, bbl.y);
+    gfx_Line(fbr.x, fbr.y, bbr.x, bbr.y);
+    gfx_SetColor(C_RED);
+    gfx_Line(ftl.x, ftl.y, ftr.x, ftr.y);
+    gfx_Line(ftr.x, ftr.y, fbr.x, fbr.y);
+    gfx_Line(fbr.x, fbr.y, fbl.x, fbl.y);
+    gfx_Line(fbl.x, fbl.y, ftl.x, ftl.y);
     gfx_SetColor(C_RED_BRIGHT);
     gfx_Line(ftl.x, ftl.y, ftr.x, ftr.y);
-    gfx_Line(ftl.x, ftl.y, fbl.x, fbl.y);
 }
 
 static void draw_obstacles(void) {
     int i;
     for (i = SEG_COUNT - 1; i >= 0; --i) {
-        if (segments[i].solid && segments[i].obstacle_lane >= -1) draw_box(&segments[i], segment_z((uint8_t)i));
+        uint8_t lane;
+        if (!segments[i].solid || segments[i].obstacle_mask == 0) continue;
+        for (lane = 0; lane < 3; ++lane) {
+            if (segments[i].obstacle_mask & (1U << lane)) {
+                draw_box_at(&segments[i], segment_z((uint8_t)i), lane);
+            }
+        }
     }
 }
 
@@ -534,50 +604,72 @@ static void draw_ball(void) {
     int16_t center, ground_h, half_w;
     bool solid, ramp;
     ScreenPoint shadow;
-    (void)center; (void)half_w; (void)solid; (void)ramp;
-    if (radius < 5) radius = 5;
-    if (radius > 16) radius = 16;
+    int offset;
+
+    (void)center;
+    (void)half_w;
+    (void)solid;
+    (void)ramp;
+    if (radius < 10) radius = 10;
+    if (radius > 18) radius = 18;
 
     sample_track_at_ball(&center, &ground_h, &half_w, &solid, &ramp);
     shadow = project_point(world_x, (int16_t)(ground_h + 1), BALL_Z);
     gfx_SetColor(C_SHADOW);
-    gfx_FillEllipse(shadow.x, shadow.y + 2, (uint24_t)(radius + 3), (uint24_t)(radius / 2));
+    gfx_FillEllipse(shadow.x, shadow.y + 3, radius + 4, radius / 2);
+
+    /* Black sphere with luminous green latitude/longitude bands. */
     gfx_SetColor(C_BALL_DARK);
-    gfx_FillCircle(p.x, p.y, (uint24_t)(radius + 1));
-    gfx_SetColor(C_BALL);
-    gfx_FillCircle(p.x - 1, p.y - 1, (uint24_t)radius);
-    gfx_SetColor(C_BALL_BRIGHT);
-    gfx_FillCircle(p.x - radius / 3, p.y - radius / 3, (uint24_t)(radius / 3));
-    gfx_SetColor(C_BALL_DARK);
-    gfx_Line(p.x - radius + 2, p.y + ((roll_phase & 7) - 4),
-             p.x + radius - 2, p.y - ((roll_phase & 7) - 4));
+    gfx_FillCircle(p.x, p.y, radius + 1);
+    gfx_SetColor(C_GREEN_BRIGHT);
+    gfx_Circle(p.x, p.y, radius);
+
+    offset = (int)((roll_phase & 15U) - 8);
+    gfx_SetColor(C_GREEN);
+    gfx_Ellipse(p.x, p.y, (radius * 2) / 3, radius);
+    gfx_Ellipse(p.x, p.y, radius, radius / 2);
+    gfx_Line(p.x - radius + 2, p.y + offset / 2,
+             p.x + radius - 2, p.y - offset / 2);
+    gfx_Line(p.x - offset / 2, p.y - radius + 2,
+             p.x + offset / 2, p.y + radius - 2);
+    gfx_SetColor(C_GREEN_BRIGHT);
+    gfx_FillCircle(p.x - radius / 3, p.y - radius / 3, 2);
+}
+
+static unsigned score_digits(uint32_t v) {
+    unsigned n = 1;
+    while (v >= 10) {
+        v /= 10;
+        ++n;
+    }
+    return n;
 }
 
 static void draw_hud(void) {
-    gfx_SetTextFGColor(C_WHITE);
-    gfx_SetTextScale(1, 1);
-    gfx_PrintStringXY("SCORE", 6, 5);
-    gfx_SetTextXY(54, 5);
+    unsigned digits = score_digits(score);
+    int x = (SCREEN_W - (int)(digits * 16U)) / 2;
+    gfx_SetTextFGColor(C_GREEN_BRIGHT);
+    gfx_SetTextScale(2, 2);
+    gfx_SetTextXY(x, 6);
     gfx_PrintUInt((unsigned int)score, 1);
-    gfx_PrintStringXY("BEST", 236, 5);
-    gfx_SetTextXY(276, 5);
-    gfx_PrintUInt((unsigned int)high_score, 1);
+    gfx_SetTextScale(1, 1);
 }
 
 static void draw_title(void) {
     draw_background();
-    gfx_SetTextFGColor(C_TRACK_BRIGHT);
-    gfx_SetTextScale(3, 3);
-    gfx_PrintStringXY("SLOPE", 77, 58);
+    gfx_SetTextFGColor(C_GREEN_BRIGHT);
+    gfx_SetTextScale(4, 4);
+    gfx_PrintStringXY("SLOPE", 60, 54);
     gfx_SetTextScale(1, 1);
     gfx_SetTextFGColor(C_WHITE);
-    gfx_PrintStringXY("TI-84 PLUS CE NATIVE", 83, 102);
-    gfx_SetTextFGColor(C_TRACK_BRIGHT);
-    gfx_PrintStringXY("LEFT / RIGHT TO STEER", 75, 142);
+    gfx_PrintStringXY("TI-84 PLUS CE", 106, 105);
+    gfx_SetTextFGColor(C_GREEN);
+    gfx_PrintStringXY("NEON NATIVE PORT", 95, 121);
     gfx_SetTextFGColor(C_WHITE);
-    gfx_PrintStringXY("[2nd] OR [enter] TO START", 58, 163);
+    gfx_PrintStringXY("LEFT / RIGHT TO STEER", 75, 158);
+    gfx_PrintStringXY("[2nd] OR [enter] TO START", 58, 178);
     gfx_SetTextFGColor(C_GREY);
-    gfx_PrintStringXY("[clear] quits", 112, 192);
+    gfx_PrintStringXY("[clear] quits", 112, 207);
 }
 
 static void draw_dead(void) {
@@ -586,21 +678,21 @@ static void draw_dead(void) {
     draw_obstacles();
     draw_ball();
     gfx_SetColor(C_BLACK);
-    gfx_FillRectangle(58, 63, 204, 116);
+    gfx_FillRectangle(66, 67, 188, 111);
     gfx_SetColor(C_RED);
-    gfx_Rectangle(58, 63, 204, 116);
+    gfx_Rectangle(66, 67, 188, 111);
     gfx_SetTextFGColor(C_RED_BRIGHT);
     gfx_SetTextScale(2, 2);
-    gfx_PrintStringXY("GAME OVER", 82, 77);
+    gfx_PrintStringXY("GAME OVER", 82, 79);
     gfx_SetTextScale(1, 1);
     gfx_SetTextFGColor(C_WHITE);
-    gfx_PrintStringXY("SCORE", 100, 116);
-    gfx_SetTextXY(154, 116);
+    gfx_PrintStringXY("SCORE", 99, 116);
+    gfx_SetTextXY(155, 116);
     gfx_PrintUInt((unsigned int)score, 1);
-    gfx_PrintStringXY("BEST", 100, 135);
-    gfx_SetTextXY(154, 135);
+    gfx_PrintStringXY("BEST", 99, 135);
+    gfx_SetTextXY(155, 135);
     gfx_PrintUInt((unsigned int)high_score, 1);
-    gfx_SetTextFGColor(C_TRACK_BRIGHT);
+    gfx_SetTextFGColor(C_GREEN_BRIGHT);
     gfx_PrintStringXY("[2nd] / [enter] AGAIN", 70, 160);
 }
 
@@ -612,7 +704,7 @@ static void draw_pause(void) {
     draw_hud();
     gfx_SetColor(C_BLACK);
     gfx_FillRectangle(92, 92, 136, 50);
-    gfx_SetColor(C_TRACK_BRIGHT);
+    gfx_SetColor(C_GREEN_BRIGHT);
     gfx_Rectangle(92, 92, 136, 50);
     gfx_SetTextFGColor(C_WHITE);
     gfx_SetTextScale(2, 2);
@@ -622,9 +714,15 @@ static void draw_pause(void) {
 
 static void render(void) {
     switch (mode) {
-        case MODE_TITLE: draw_title(); break;
-        case MODE_DEAD: draw_dead(); break;
-        case MODE_PAUSE: draw_pause(); break;
+        case MODE_TITLE:
+            draw_title();
+            break;
+        case MODE_DEAD:
+            draw_dead();
+            break;
+        case MODE_PAUSE:
+            draw_pause();
+            break;
         case MODE_PLAY:
         default:
             draw_background();
@@ -667,13 +765,15 @@ int main(void) {
         alpha = (kb_Data[2] & kb_Alpha) != 0;
         clear = (kb_Data[6] & kb_Clear) != 0;
 
-        press_start = edge(second, &key_prev_2nd) | edge(enter, &key_prev_enter);
+        press_start = edge(second, &key_prev_2nd);
+        press_start = edge(enter, &key_prev_enter) || press_start;
         press_pause = edge(alpha, &key_prev_alpha);
         press_clear = edge(clear, &key_prev_clear);
 
         if (press_clear) {
-            if (mode == MODE_TITLE) running = false;
-            else {
+            if (mode == MODE_TITLE) {
+                running = false;
+            } else {
                 if (score > high_score) high_score = score;
                 mode = MODE_TITLE;
                 save_needed = true;
@@ -698,7 +798,7 @@ int main(void) {
         }
 
         render();
-        delay(28);
+        delay(25);
     }
 
     gfx_End();
